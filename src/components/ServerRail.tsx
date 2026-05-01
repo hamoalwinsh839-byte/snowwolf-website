@@ -28,13 +28,13 @@ export default function ServerRail({ servers, activeId, onSelect, onCreate, onLo
   const [pickerOpen, setPickerOpen] = useState(false);
   const [code, setCode] = useState("");
 
-  const join = () => {
+  const join = async () => {
     try {
-      const s = api.joinServerByInvite(code);
-      toast.success(`انضممت لـ ${s.name}`);
+      const sid = await api.joinServerByInvite(code);
+      toast.success("اتم الانضمام");
       setCode("");
       setJoining(false);
-      onSelect(s.id);
+      onSelect(sid);
     } catch (err: any) {
       toast.error(err.message);
     }

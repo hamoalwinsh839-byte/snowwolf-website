@@ -1,16 +1,18 @@
-// SnowWolf — Local storage layer (v3 — Discord-like full features)
+// SnowWolf — Supabase-backed data layer (replaces localStorage v3)
+import { supabase } from "@/integrations/supabase/client";
 
 export type Role = "owner" | "admin" | "member";
+export type UserStatus = "online" | "idle" | "dnd" | "invisible";
 
 export type User = {
   id: string;
   username: string;
-  password: string;
+  password: string; // unused (Supabase Auth manages it)
   avatarColor: string;
   avatarUrl?: string;
   bannerUrl?: string;
   bio?: string;
-  status: "online" | "idle" | "dnd" | "invisible";
+  status: UserStatus;
   customStatus?: string;
   createdAt: number;
 };
@@ -55,7 +57,7 @@ export type Attachment = {
 
 export type Message = {
   id: string;
-  channelId: string; // for DMs: dm:{userIdA}_{userIdB} (sorted)
+  channelId: string; // text-channel id or "dm:<sortedUUID>_<sortedUUID>"
   userId: string;
   content: string;
   createdAt: number;
@@ -63,7 +65,7 @@ export type Message = {
   reactions?: Reaction[];
   attachments?: Attachment[];
   replyToId?: string;
-  mentions?: string[]; // user ids
+  mentions?: string[];
 };
 
 export type FriendStatus = "pending" | "accepted" | "blocked";
@@ -75,20 +77,16 @@ export type Friendship = {
   createdAt: number;
 };
 
-export type ReadState = Record<string, number>; // channelId -> last read timestamp (per user)
-
-type DB = {
+export type DBSnapshot = {
   users: User[];
   servers: Server[];
   channels: Channel[];
   messages: Message[];
   friendships: Friendship[];
-  reads: Record<string, ReadState>; // userId -> ReadState
+  reads: Record<string, Record<string, number>>;
   session: { userId: string | null };
   voice: Record<string, string[]>;
 };
-
-const KEY = "snowwolf.db.v3";
 
 const COLORS = [
   "from-sky-400 to-blue-600",
@@ -99,39 +97,24 @@ const COLORS = [
   "from-teal-400 to-sky-600",
 ];
 
-function genInvite() { return Math.random().toString(36).slice(2, 10); }
+export function randomColor() {
+  return COLORS[Math.floor(Math.random() * COLORS.length)];
+}
 
 export function dmChannelId(a: string, b: string) {
   return "dm:" + [a, b].sort().join("_");
 }
 
-function seed(): DB {
-  const ownerId = "system-wolf";
-  const serverId = crypto.randomUUID();
-  const catGeneral = "عام";
-  const catVoice = "صوت";
+// ========== In-memory cache ==========
+// useDB hydrates this and re-hydrates on realtime events.
+// Components read it synchronously via the `db` snapshot.
+let _cache: DBSnapshot = emptyCache();
+
+function emptyCache(): DBSnapshot {
   return {
     users: [],
-    servers: [
-      {
-        id: serverId,
-        name: "Snow Wolf Pack",
-        iconColor: "from-sky-400 to-blue-600",
-        ownerId,
-        members: [],
-        inviteCode: genInvite(),
-        categories: [catGeneral, catVoice],
-        pinnedMessageIds: [],
-        createdAt: Date.now(),
-      },
-    ],
-    channels: [
-      { id: crypto.randomUUID(), serverId, name: "ترحيب", type: "text", topic: "أهلا في القطيع 🐺", category: catGeneral },
-      { id: crypto.randomUUID(), serverId, name: "عام", type: "text", category: catGeneral },
-      { id: crypto.randomUUID(), serverId, name: "ميمز", type: "text", category: catGeneral },
-      { id: crypto.randomUUID(), serverId, name: "اللوبي", type: "voice", category: catVoice },
-      { id: crypto.randomUUID(), serverId, name: "جيمنج", type: "voice", category: catVoice },
-    ],
+    servers: [],
+    channels: [],
     messages: [],
     friendships: [],
     reads: {},
@@ -140,36 +123,186 @@ function seed(): DB {
   };
 }
 
-export function loadDB(): DB {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) {
-      const fresh = seed();
-      localStorage.setItem(KEY, JSON.stringify(fresh));
-      return fresh;
-    }
-    const db = JSON.parse(raw);
-    // safety defaults for older shapes
-    db.friendships = db.friendships || [];
-    db.reads = db.reads || {};
-    db.servers.forEach((s: Server) => {
-      s.categories = s.categories || [];
-      s.pinnedMessageIds = s.pinnedMessageIds || [];
-    });
-    return db;
-  } catch {
-    const fresh = seed();
-    localStorage.setItem(KEY, JSON.stringify(fresh));
-    return fresh;
-  }
+export function getCache(): DBSnapshot {
+  return _cache;
 }
 
-export function saveDB(db: DB) {
-  localStorage.setItem(KEY, JSON.stringify(db));
+export function setCache(next: DBSnapshot) {
+  _cache = next;
   window.dispatchEvent(new CustomEvent("snowwolf:db"));
 }
 
-export function randomColor() { return COLORS[Math.floor(Math.random() * COLORS.length)]; }
+export function patchCache(patch: Partial<DBSnapshot>) {
+  _cache = { ..._cache, ...patch };
+  window.dispatchEvent(new CustomEvent("snowwolf:db"));
+}
+
+// ========== Mappers (snake_case <-> camelCase) ==========
+function mapProfile(p: any): User {
+  return {
+    id: p.id,
+    username: p.username,
+    password: "",
+    avatarColor: p.avatar_color,
+    avatarUrl: p.avatar_url || undefined,
+    bannerUrl: p.banner_url || undefined,
+    bio: p.bio || undefined,
+    status: p.status,
+    customStatus: p.custom_status || undefined,
+    createdAt: new Date(p.created_at).getTime(),
+  };
+}
+
+function mapServer(s: any, members: any[]): Server {
+  return {
+    id: s.id,
+    name: s.name,
+    iconColor: s.icon_color,
+    iconUrl: s.icon_url || undefined,
+    ownerId: s.owner_id,
+    inviteCode: s.invite_code,
+    categories: s.categories || [],
+    pinnedMessageIds: s.pinned_message_ids || [],
+    createdAt: new Date(s.created_at).getTime(),
+    members: members
+      .filter((m) => m.server_id === s.id)
+      .map((m) => ({
+        userId: m.user_id,
+        role: m.role,
+        joinedAt: new Date(m.joined_at).getTime(),
+        nickname: m.nickname || undefined,
+      })),
+  };
+}
+
+function mapChannel(c: any): Channel {
+  return {
+    id: c.id,
+    serverId: c.server_id,
+    name: c.name,
+    type: c.type,
+    topic: c.topic || undefined,
+    category: c.category || undefined,
+  };
+}
+
+function mapMessage(m: any, reactions: any[]): Message {
+  // Group reactions for this message
+  const rxs: Reaction[] = [];
+  reactions
+    .filter((r) => r.message_id === m.id)
+    .forEach((r) => {
+      let g = rxs.find((x) => x.emoji === r.emoji);
+      if (!g) {
+        g = { emoji: r.emoji, userIds: [] };
+        rxs.push(g);
+      }
+      g.userIds.push(r.user_id);
+    });
+
+  return {
+    id: m.id,
+    channelId: m.channel_key,
+    userId: m.user_id,
+    content: m.content,
+    createdAt: new Date(m.created_at).getTime(),
+    editedAt: m.edited_at ? new Date(m.edited_at).getTime() : undefined,
+    reactions: rxs,
+    attachments: Array.isArray(m.attachments) ? m.attachments : [],
+    replyToId: m.reply_to_id || undefined,
+    mentions: m.mentions || [],
+  };
+}
+
+function mapFriendship(f: any): Friendship {
+  return {
+    id: f.id,
+    fromId: f.from_id,
+    toId: f.to_id,
+    status: f.status,
+    createdAt: new Date(f.created_at).getTime(),
+  };
+}
+
+// ========== Full hydrate ==========
+export async function hydrateAll(currentUserId: string | null): Promise<DBSnapshot> {
+  if (!currentUserId) {
+    const snap = emptyCache();
+    setCache(snap);
+    return snap;
+  }
+
+  // Run independent queries in parallel
+  const [
+    profilesRes,
+    serversRes,
+    membersRes,
+    channelsRes,
+    messagesRes,
+    reactionsRes,
+    friendshipsRes,
+    readsRes,
+    voiceRes,
+  ] = await Promise.all([
+    supabase.from("profiles").select("*"),
+    supabase.from("servers").select("*"),
+    supabase.from("server_members").select("*"),
+    supabase.from("channels").select("*").order("position"),
+    supabase.from("messages").select("*").order("created_at"),
+    supabase.from("reactions").select("*"),
+    supabase.from("friendships").select("*"),
+    supabase.from("read_states").select("*").eq("user_id", currentUserId),
+    supabase.from("voice_presence").select("*"),
+  ]);
+
+  const profiles = profilesRes.data || [];
+  const serversRaw = serversRes.data || [];
+  const membersRaw = membersRes.data || [];
+  const channelsRaw = channelsRes.data || [];
+  const messagesRaw = messagesRes.data || [];
+  const reactionsRaw = reactionsRes.data || [];
+  const friendshipsRaw = friendshipsRes.data || [];
+  const readsRaw = readsRes.data || [];
+  const voiceRaw = voiceRes.data || [];
+
+  const users = profiles.map(mapProfile);
+  const servers = serversRaw.map((s: any) => mapServer(s, membersRaw));
+  const channels = channelsRaw.map(mapChannel);
+  const messages = messagesRaw.map((m: any) => mapMessage(m, reactionsRaw));
+  const friendships = friendshipsRaw.map(mapFriendship);
+
+  const reads: Record<string, Record<string, number>> = {};
+  reads[currentUserId] = {};
+  readsRaw.forEach((r: any) => {
+    reads[currentUserId][r.channel_key] = new Date(r.last_read_at).getTime();
+  });
+
+  const voice: Record<string, string[]> = {};
+  voiceRaw.forEach((v: any) => {
+    voice[v.channel_id] = voice[v.channel_id] || [];
+    voice[v.channel_id].push(v.user_id);
+  });
+
+  const snap: DBSnapshot = {
+    users,
+    servers,
+    channels,
+    messages,
+    friendships,
+    reads,
+    session: { userId: currentUserId },
+    voice,
+  };
+  setCache(snap);
+  return snap;
+}
+
+// ========== Helper ==========
+function meId(): string {
+  const id = _cache.session.userId;
+  if (!id) throw new Error("غير مسجل دخول");
+  return id;
+}
 
 function extractMentions(content: string, users: User[]): string[] {
   const ids: string[] = [];
@@ -180,378 +313,326 @@ function extractMentions(content: string, users: User[]): string[] {
   return ids;
 }
 
+// ========== API ==========
 export const api = {
-  signup(username: string, password: string): User {
-    const db = loadDB();
+  // ----- Auth -----
+  async signup(email: string, password: string, username: string): Promise<void> {
+    const e = email.trim().toLowerCase();
     const u = username.trim();
     if (u.length < 2) throw new Error("اسم المستخدم قصير");
-    if (password.length < 4) throw new Error("كلمة السر ضعيفة");
-    if (db.users.some((x) => x.username.toLowerCase() === u.toLowerCase()))
-      throw new Error("الاسم مستخدم بالفعل");
-    const isFirst = db.users.length === 0;
-    const user: User = {
-      id: crypto.randomUUID(),
-      username: u,
+    if (password.length < 6) throw new Error("كلمة السر لازم 6 حروف على الأقل");
+    if (!e || !e.includes("@")) throw new Error("إيميل غير صحيح");
+
+    const { error } = await supabase.auth.signUp({
+      email: e,
       password,
-      avatarColor: randomColor(),
-      status: "online",
-      createdAt: Date.now(),
-    };
-    db.users.push(user);
-    db.servers.forEach((s) => {
-      if (!s.members.find((m) => m.userId === user.id)) {
-        s.members.push({ userId: user.id, role: isFirst ? "owner" : "member", joinedAt: Date.now() });
-      }
-      if (isFirst && s.ownerId === "system-wolf") s.ownerId = user.id;
+      options: {
+        emailRedirectTo: `${window.location.origin}/`,
+        data: { username: u },
+      },
     });
-    db.session.userId = user.id;
-    saveDB(db);
-    return user;
+    if (error) {
+      const msg = error.message.toLowerCase();
+      if (msg.includes("already") || msg.includes("registered")) throw new Error("الإيميل ده مسجّل قبل كده");
+      throw new Error(error.message);
+    }
   },
 
-  login(username: string, password: string): User {
-    const db = loadDB();
-    const user = db.users.find((x) => x.username.toLowerCase() === username.trim().toLowerCase());
-    if (!user || user.password !== password) throw new Error("بيانات غير صحيحة");
-    db.session.userId = user.id;
-    user.status = "online";
-    saveDB(db);
-    return user;
+  async login(email: string, password: string): Promise<void> {
+    const { error } = await supabase.auth.signInWithPassword({
+      email: email.trim().toLowerCase(),
+      password,
+    });
+    if (error) {
+      const msg = error.message.toLowerCase();
+      if (msg.includes("invalid")) throw new Error("الإيميل أو الباسورد غلط");
+      throw new Error(error.message);
+    }
   },
 
-  logout() {
-    const db = loadDB();
-    Object.keys(db.voice).forEach((cid) => {
-      db.voice[cid] = (db.voice[cid] || []).filter((id) => id !== db.session.userId);
-    });
-    db.session.userId = null;
-    saveDB(db);
+  async logout() {
+    // Best-effort: clear voice presence
+    const me = _cache.session.userId;
+    if (me) {
+      await supabase.from("voice_presence").delete().eq("user_id", me);
+    }
+    await supabase.auth.signOut();
+    setCache(emptyCache());
   },
 
   currentUser(): User | null {
-    const db = loadDB();
-    if (!db.session.userId) return null;
-    return db.users.find((u) => u.id === db.session.userId) || null;
+    const id = _cache.session.userId;
+    if (!id) return null;
+    return _cache.users.find((u) => u.id === id) || null;
   },
 
-  updateProfile(patch: Partial<Pick<User, "username" | "avatarUrl" | "avatarColor" | "bannerUrl" | "bio" | "status" | "customStatus" | "password">>) {
-    const db = loadDB();
-    const me = db.users.find((u) => u.id === db.session.userId);
-    if (!me) throw new Error("غير مسجل");
-    if (patch.username) {
-      const u = patch.username.trim();
-      if (u.length < 2) throw new Error("اسم قصير");
-      if (db.users.some((x) => x.id !== me.id && x.username.toLowerCase() === u.toLowerCase()))
-        throw new Error("الاسم مستخدم");
-      me.username = u;
-    }
-    if (patch.avatarUrl !== undefined) me.avatarUrl = patch.avatarUrl;
-    if (patch.bannerUrl !== undefined) me.bannerUrl = patch.bannerUrl;
-    if (patch.avatarColor) me.avatarColor = patch.avatarColor;
-    if (patch.bio !== undefined) me.bio = patch.bio;
-    if (patch.status) me.status = patch.status;
-    if (patch.customStatus !== undefined) me.customStatus = patch.customStatus;
-    if (patch.password) {
-      if (patch.password.length < 4) throw new Error("كلمة سر ضعيفة");
-      me.password = patch.password;
-    }
-    saveDB(db);
-    return me;
+  // ----- Profile -----
+  async updateProfile(patch: Partial<Pick<User, "username" | "avatarUrl" | "avatarColor" | "bannerUrl" | "bio" | "status" | "customStatus">>) {
+    const id = meId();
+    const upd: any = {};
+    if (patch.username !== undefined) upd.username = patch.username.trim();
+    if (patch.avatarUrl !== undefined) upd.avatar_url = patch.avatarUrl;
+    if (patch.bannerUrl !== undefined) upd.banner_url = patch.bannerUrl;
+    if (patch.avatarColor) upd.avatar_color = patch.avatarColor;
+    if (patch.bio !== undefined) upd.bio = patch.bio;
+    if (patch.status) upd.status = patch.status;
+    if (patch.customStatus !== undefined) upd.custom_status = patch.customStatus;
+    const { error } = await supabase.from("profiles").update(upd).eq("id", id);
+    if (error) throw new Error(error.message);
   },
 
-  // ===== Servers =====
-  createServer(name: string, iconUrl?: string): Server {
-    const db = loadDB();
-    const me = db.session.userId!;
-    const cat1 = "عام", cat2 = "صوت";
-    const server: Server = {
-      id: crypto.randomUUID(),
-      name: name.trim() || "سيرفر جديد",
-      iconColor: randomColor(),
-      iconUrl,
-      ownerId: me,
-      members: [{ userId: me, role: "owner", joinedAt: Date.now() }],
-      inviteCode: genInvite(),
-      categories: [cat1, cat2],
-      pinnedMessageIds: [],
-      createdAt: Date.now(),
-    };
-    db.servers.push(server);
-    db.channels.push(
-      { id: crypto.randomUUID(), serverId: server.id, name: "عام", type: "text", category: cat1 },
-      { id: crypto.randomUUID(), serverId: server.id, name: "اللوبي", type: "voice", category: cat2 }
-    );
-    saveDB(db);
-    return server;
+  // ----- Servers -----
+  async createServer(name: string, iconUrl?: string): Promise<Server> {
+    const id = meId();
+    const { data, error } = await supabase
+      .from("servers")
+      .insert({
+        name: name.trim() || "سيرفر جديد",
+        owner_id: id,
+        icon_color: randomColor(),
+        icon_url: iconUrl ?? null,
+      })
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    // Trigger handle_new_server() auto-creates owner membership + default channels.
+    return mapServer(data, [{ server_id: data.id, user_id: id, role: "owner", joined_at: new Date().toISOString(), nickname: null }]);
   },
 
-  updateServer(serverId: string, patch: Partial<Pick<Server, "name" | "iconUrl" | "iconColor">>) {
-    const db = loadDB();
-    const s = db.servers.find((x) => x.id === serverId);
-    if (!s) return;
-    if (patch.name) s.name = patch.name.trim() || s.name;
-    if (patch.iconUrl !== undefined) s.iconUrl = patch.iconUrl;
-    if (patch.iconColor) s.iconColor = patch.iconColor;
-    saveDB(db);
+  async updateServer(serverId: string, patch: Partial<Pick<Server, "name" | "iconUrl" | "iconColor">>) {
+    const upd: any = {};
+    if (patch.name) upd.name = patch.name.trim();
+    if (patch.iconUrl !== undefined) upd.icon_url = patch.iconUrl;
+    if (patch.iconColor) upd.icon_color = patch.iconColor;
+    const { error } = await supabase.from("servers").update(upd).eq("id", serverId);
+    if (error) throw new Error(error.message);
   },
 
-  deleteServer(serverId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    const s = db.servers.find((x) => x.id === serverId);
-    if (!s || s.ownerId !== me) throw new Error("مش مسموح");
-    db.servers = db.servers.filter((x) => x.id !== serverId);
-    const channelIds = db.channels.filter((c) => c.serverId === serverId).map((c) => c.id);
-    db.channels = db.channels.filter((c) => c.serverId !== serverId);
-    db.messages = db.messages.filter((m) => !channelIds.includes(m.channelId));
-    saveDB(db);
+  async deleteServer(serverId: string) {
+    const { error } = await supabase.from("servers").delete().eq("id", serverId);
+    if (error) throw new Error(error.message);
   },
 
-  joinServerByInvite(code: string): Server {
-    const db = loadDB();
-    const me = db.session.userId!;
-    const s = db.servers.find((x) => x.inviteCode === code.trim());
-    if (!s) throw new Error("كود دعوة غير صحيح");
-    if (!s.members.find((m) => m.userId === me)) {
-      s.members.push({ userId: me, role: "member", joinedAt: Date.now() });
-    }
-    saveDB(db);
-    return s;
+  async joinServerByInvite(code: string): Promise<string> {
+    const { data, error } = await supabase.rpc("join_server_by_invite", { _code: code.trim() });
+    if (error) throw new Error("كود دعوة غير صحيح");
+    return data as string;
   },
 
-  leaveServer(serverId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    const s = db.servers.find((x) => x.id === serverId);
-    if (!s || s.ownerId === me) return;
-    s.members = s.members.filter((m) => m.userId !== me);
-    saveDB(db);
+  async leaveServer(serverId: string) {
+    const id = meId();
+    const { error } = await supabase
+      .from("server_members")
+      .delete()
+      .eq("server_id", serverId)
+      .eq("user_id", id);
+    if (error) throw new Error(error.message);
   },
 
-  setMemberRole(serverId: string, userId: string, role: Role) {
-    const db = loadDB();
-    const me = db.session.userId;
-    const s = db.servers.find((x) => x.id === serverId);
-    if (!s || s.ownerId !== me) throw new Error("مش مسموح");
-    const m = s.members.find((m) => m.userId === userId);
-    if (m && m.userId !== s.ownerId) m.role = role;
-    saveDB(db);
+  async setMemberRole(serverId: string, userId: string, role: Role) {
+    const { error } = await supabase
+      .from("server_members")
+      .update({ role })
+      .eq("server_id", serverId)
+      .eq("user_id", userId);
+    if (error) throw new Error(error.message);
   },
 
-  setMemberNickname(serverId: string, userId: string, nickname: string) {
-    const db = loadDB();
-    const s = db.servers.find((x) => x.id === serverId);
-    const m = s?.members.find((m) => m.userId === userId);
-    if (m) m.nickname = nickname.trim() || undefined;
-    saveDB(db);
+  async setMemberNickname(serverId: string, userId: string, nickname: string) {
+    const { error } = await supabase
+      .from("server_members")
+      .update({ nickname: nickname.trim() || null })
+      .eq("server_id", serverId)
+      .eq("user_id", userId);
+    if (error) throw new Error(error.message);
   },
 
-  kickMember(serverId: string, userId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    const s = db.servers.find((x) => x.id === serverId);
-    if (!s) return;
-    const myRole = s.members.find((m) => m.userId === me)?.role;
-    if (myRole !== "owner" && myRole !== "admin") throw new Error("مش مسموح");
-    if (userId === s.ownerId) return;
-    s.members = s.members.filter((m) => m.userId !== userId);
-    saveDB(db);
+  async kickMember(serverId: string, userId: string) {
+    const { error } = await supabase
+      .from("server_members")
+      .delete()
+      .eq("server_id", serverId)
+      .eq("user_id", userId);
+    if (error) throw new Error(error.message);
   },
 
-  // ===== Categories =====
-  addCategory(serverId: string, name: string) {
-    const db = loadDB();
-    const s = db.servers.find((x) => x.id === serverId);
+  // ----- Categories -----
+  async addCategory(serverId: string, name: string) {
+    const s = _cache.servers.find((x) => x.id === serverId);
     if (!s) return;
     const n = name.trim();
     if (!n || s.categories.includes(n)) return;
-    s.categories.push(n);
-    saveDB(db);
+    const next = [...s.categories, n];
+    const { error } = await supabase.from("servers").update({ categories: next }).eq("id", serverId);
+    if (error) throw new Error(error.message);
   },
 
-  removeCategory(serverId: string, name: string) {
-    const db = loadDB();
-    const s = db.servers.find((x) => x.id === serverId);
+  async removeCategory(serverId: string, name: string) {
+    const s = _cache.servers.find((x) => x.id === serverId);
     if (!s) return;
-    s.categories = s.categories.filter((c) => c !== name);
-    db.channels.forEach((c) => { if (c.serverId === serverId && c.category === name) c.category = undefined; });
-    saveDB(db);
+    const next = s.categories.filter((c) => c !== name);
+    await supabase.from("servers").update({ categories: next }).eq("id", serverId);
+    // Clear category from channels
+    await supabase
+      .from("channels")
+      .update({ category: null })
+      .eq("server_id", serverId)
+      .eq("category", name);
   },
 
-  // ===== Channels =====
-  createChannel(serverId: string, name: string, type: "text" | "voice", category?: string): Channel {
-    const db = loadDB();
-    const channel: Channel = { id: crypto.randomUUID(), serverId, name: name.trim() || "قناة", type, category };
-    db.channels.push(channel);
-    saveDB(db);
-    return channel;
+  // ----- Channels -----
+  async createChannel(serverId: string, name: string, type: "text" | "voice", category?: string): Promise<void> {
+    const { error } = await supabase.from("channels").insert({
+      server_id: serverId,
+      name: name.trim() || "قناة",
+      type,
+      category: category ?? null,
+    });
+    if (error) throw new Error(error.message);
   },
 
-  deleteChannel(channelId: string) {
-    const db = loadDB();
-    db.channels = db.channels.filter((c) => c.id !== channelId);
-    db.messages = db.messages.filter((m) => m.channelId !== channelId);
-    saveDB(db);
+  async deleteChannel(channelId: string) {
+    const { error } = await supabase.from("channels").delete().eq("id", channelId);
+    if (error) throw new Error(error.message);
   },
 
-  renameChannel(channelId: string, name: string) {
-    const db = loadDB();
-    const c = db.channels.find((c) => c.id === channelId);
-    if (c) c.name = name.trim() || c.name;
-    saveDB(db);
+  async renameChannel(channelId: string, name: string) {
+    const { error } = await supabase
+      .from("channels")
+      .update({ name: name.trim() })
+      .eq("id", channelId);
+    if (error) throw new Error(error.message);
   },
 
-  // ===== Messages =====
-  sendMessage(channelId: string, content: string, opts?: { attachments?: Attachment[]; replyToId?: string }) {
-    const db = loadDB();
-    if (!db.session.userId) return;
+  // ----- Messages -----
+  async sendMessage(channelId: string, content: string, opts?: { attachments?: Attachment[]; replyToId?: string }) {
+    const id = meId();
     const text = content.trim();
     if (!text && !(opts?.attachments?.length)) return;
-    const mentions = extractMentions(text, db.users);
-    db.messages.push({
-      id: crypto.randomUUID(),
-      channelId,
-      userId: db.session.userId,
+    const mentions = extractMentions(text, _cache.users);
+
+    let payload: any = {
+      channel_key: channelId,
+      user_id: id,
       content: text,
-      createdAt: Date.now(),
-      reactions: [],
-      attachments: opts?.attachments,
-      replyToId: opts?.replyToId,
       mentions,
-    });
-    saveDB(db);
-  },
-
-  editMessage(messageId: string, content: string) {
-    const db = loadDB();
-    const m = db.messages.find((x) => x.id === messageId);
-    if (!m || m.userId !== db.session.userId) return;
-    m.content = content.trim();
-    m.editedAt = Date.now();
-    m.mentions = extractMentions(m.content, db.users);
-    saveDB(db);
-  },
-
-  deleteMessage(messageId: string) {
-    const db = loadDB();
-    const m = db.messages.find((x) => x.id === messageId);
-    if (!m) return;
-    if (m.userId !== db.session.userId) {
-      const ch = db.channels.find((c) => c.id === m.channelId);
-      const s = db.servers.find((s) => s.id === ch?.serverId);
-      const myRole = s?.members.find((mm) => mm.userId === db.session.userId)?.role;
-      if (myRole !== "owner" && myRole !== "admin") return;
-    }
-    db.messages = db.messages.filter((x) => x.id !== messageId);
-    db.servers.forEach((s) => { s.pinnedMessageIds = s.pinnedMessageIds.filter((id) => id !== messageId); });
-    saveDB(db);
-  },
-
-  pinMessage(messageId: string) {
-    const db = loadDB();
-    const m = db.messages.find((x) => x.id === messageId);
-    if (!m) return;
-    const ch = db.channels.find((c) => c.id === m.channelId);
-    const s = db.servers.find((s) => s.id === ch?.serverId);
-    if (!s) return;
-    if (!s.pinnedMessageIds.includes(messageId)) s.pinnedMessageIds.push(messageId);
-    else s.pinnedMessageIds = s.pinnedMessageIds.filter((id) => id !== messageId);
-    saveDB(db);
-  },
-
-  toggleReaction(messageId: string, emoji: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    if (!me) return;
-    const m = db.messages.find((x) => x.id === messageId);
-    if (!m) return;
-    m.reactions = m.reactions || [];
-    let r = m.reactions.find((r) => r.emoji === emoji);
-    if (!r) {
-      r = { emoji, userIds: [me] };
-      m.reactions.push(r);
-    } else if (r.userIds.includes(me)) {
-      r.userIds = r.userIds.filter((id) => id !== me);
-      if (r.userIds.length === 0) m.reactions = m.reactions.filter((x) => x.emoji !== emoji);
+      attachments: opts?.attachments || [],
+      reply_to_id: opts?.replyToId ?? null,
+    };
+    if (channelId.startsWith("dm:")) {
+      // DM channel
+      const ids = channelId.slice(3).split("_").sort();
+      payload.dm_user_a = ids[0];
+      payload.dm_user_b = ids[1];
     } else {
-      r.userIds.push(me);
+      payload.channel_id = channelId;
     }
-    saveDB(db);
+    const { error } = await supabase.from("messages").insert(payload);
+    if (error) throw new Error(error.message);
   },
 
-  // ===== Read state =====
-  markRead(channelId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    if (!me) return;
-    db.reads[me] = db.reads[me] || {};
-    db.reads[me][channelId] = Date.now();
-    saveDB(db);
+  async editMessage(messageId: string, content: string) {
+    const text = content.trim();
+    const mentions = extractMentions(text, _cache.users);
+    const { error } = await supabase
+      .from("messages")
+      .update({ content: text, edited_at: new Date().toISOString(), mentions })
+      .eq("id", messageId);
+    if (error) throw new Error(error.message);
   },
 
-  // ===== Voice =====
-  joinVoice(channelId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    if (!me) return;
-    Object.keys(db.voice).forEach((cid) => {
-      db.voice[cid] = (db.voice[cid] || []).filter((id) => id !== me);
-    });
-    db.voice[channelId] = [...(db.voice[channelId] || []), me];
-    saveDB(db);
+  async deleteMessage(messageId: string) {
+    const { error } = await supabase.from("messages").delete().eq("id", messageId);
+    if (error) throw new Error(error.message);
   },
 
-  leaveVoice(channelId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    if (!me) return;
-    db.voice[channelId] = (db.voice[channelId] || []).filter((id) => id !== me);
-    saveDB(db);
+  async pinMessage(messageId: string) {
+    const m = _cache.messages.find((x) => x.id === messageId);
+    if (!m) return;
+    const ch = _cache.channels.find((c) => c.id === m.channelId);
+    if (!ch) return;
+    const s = _cache.servers.find((s) => s.id === ch.serverId);
+    if (!s) return;
+    const has = s.pinnedMessageIds.includes(messageId);
+    const next = has
+      ? s.pinnedMessageIds.filter((id) => id !== messageId)
+      : [...s.pinnedMessageIds, messageId];
+    const { error } = await supabase.from("servers").update({ pinned_message_ids: next }).eq("id", s.id);
+    if (error) throw new Error(error.message);
   },
 
-  // ===== Friends =====
-  sendFriendRequest(usernameOrId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    if (!me) return;
-    const target = db.users.find(
+  async toggleReaction(messageId: string, emoji: string) {
+    const id = meId();
+    const m = _cache.messages.find((x) => x.id === messageId);
+    if (!m) return;
+    const r = (m.reactions || []).find((r) => r.emoji === emoji);
+    if (r && r.userIds.includes(id)) {
+      await supabase.from("reactions").delete().eq("message_id", messageId).eq("user_id", id).eq("emoji", emoji);
+    } else {
+      await supabase.from("reactions").insert({ message_id: messageId, user_id: id, emoji });
+    }
+  },
+
+  // ----- Read state -----
+  async markRead(channelId: string) {
+    const id = meId();
+    await supabase
+      .from("read_states")
+      .upsert({ user_id: id, channel_key: channelId, last_read_at: new Date().toISOString() }, { onConflict: "user_id,channel_key" });
+  },
+
+  // ----- Voice -----
+  async joinVoice(channelId: string) {
+    const id = meId();
+    // Leave all other voice channels first
+    await supabase.from("voice_presence").delete().eq("user_id", id);
+    await supabase.from("voice_presence").insert({ channel_id: channelId, user_id: id });
+  },
+
+  async leaveVoice(_channelId: string) {
+    const id = _cache.session.userId;
+    if (!id) return;
+    await supabase.from("voice_presence").delete().eq("user_id", id);
+  },
+
+  // ----- Friends -----
+  async sendFriendRequest(usernameOrId: string) {
+    const id = meId();
+    const target = _cache.users.find(
       (u) => u.id === usernameOrId || u.username.toLowerCase() === usernameOrId.trim().toLowerCase()
     );
     if (!target) throw new Error("المستخدم غير موجود");
-    if (target.id === me) throw new Error("مينفعش تضيف نفسك");
-    const existing = db.friendships.find(
-      (f) => (f.fromId === me && f.toId === target.id) || (f.fromId === target.id && f.toId === me)
+    if (target.id === id) throw new Error("مينفعش تضيف نفسك");
+    const existing = _cache.friendships.find(
+      (f) => (f.fromId === id && f.toId === target.id) || (f.fromId === target.id && f.toId === id)
     );
     if (existing) throw new Error("في طلب أو صداقة بالفعل");
-    db.friendships.push({
-      id: crypto.randomUUID(),
-      fromId: me,
-      toId: target.id,
+    const { error } = await supabase.from("friendships").insert({
+      from_id: id,
+      to_id: target.id,
       status: "pending",
-      createdAt: Date.now(),
     });
-    saveDB(db);
+    if (error) throw new Error(error.message);
   },
 
-  acceptFriend(friendshipId: string) {
-    const db = loadDB();
-    const f = db.friendships.find((x) => x.id === friendshipId);
-    if (f && f.toId === db.session.userId) f.status = "accepted";
-    saveDB(db);
+  async acceptFriend(friendshipId: string) {
+    const { error } = await supabase
+      .from("friendships")
+      .update({ status: "accepted" })
+      .eq("id", friendshipId);
+    if (error) throw new Error(error.message);
   },
 
-  rejectFriend(friendshipId: string) {
-    const db = loadDB();
-    db.friendships = db.friendships.filter((x) => x.id !== friendshipId);
-    saveDB(db);
+  async rejectFriend(friendshipId: string) {
+    const { error } = await supabase.from("friendships").delete().eq("id", friendshipId);
+    if (error) throw new Error(error.message);
   },
 
-  removeFriend(otherUserId: string) {
-    const db = loadDB();
-    const me = db.session.userId;
-    db.friendships = db.friendships.filter(
-      (f) => !((f.fromId === me && f.toId === otherUserId) || (f.fromId === otherUserId && f.toId === me))
-    );
-    saveDB(db);
+  async removeFriend(otherUserId: string) {
+    const id = meId();
+    await supabase
+      .from("friendships")
+      .delete()
+      .or(`and(from_id.eq.${id},to_id.eq.${otherUserId}),and(from_id.eq.${otherUserId},to_id.eq.${id})`);
   },
 };

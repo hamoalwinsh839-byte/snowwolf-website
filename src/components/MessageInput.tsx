@@ -1,9 +1,11 @@
 import { Attachment, User, api } from "@/lib/store";
 import { useEffect, useRef, useState } from "react";
-import { Smile, Send, Paperclip, X, AtSign } from "lucide-react";
+import { Smile, Send, Paperclip, X, AtSign, Loader2 } from "lucide-react";
 import { Input } from "./ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import Avatar from "./Avatar";
+import { supabase } from "@/integrations/supabase/client";
+import { toast } from "sonner";
 
 const QUICK_EMOJIS = ["👍","❤️","😂","🔥","🐺","❄️","🎉","😮","😢","👀","🙏","💯","✨","🤔","😎"];
 
@@ -20,6 +22,7 @@ export default function MessageInput({
 }) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [uploadingCount, setUploadingCount] = useState(0);
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -29,26 +32,42 @@ export default function MessageInput({
     inputRef.current?.focus();
   }, [channelId, replyTo?.id]);
 
-  const send = (e?: React.FormEvent) => {
+  const send = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!text.trim() && attachments.length === 0) return;
-    api.sendMessage(channelId, text, { attachments: attachments.length ? attachments : undefined, replyToId: replyTo?.id });
-    setText("");
-    setAttachments([]);
-    onCancelReply?.();
-    onSent?.();
+    if (uploadingCount > 0) { toast.info("في صور بترفع لسه..."); return; }
+    try {
+      await api.sendMessage(channelId, text, { attachments: attachments.length ? attachments : undefined, replyToId: replyTo?.id });
+      setText("");
+      setAttachments([]);
+      onCancelReply?.();
+      onSent?.();
+    } catch (err: any) {
+      toast.error(err.message || "فشل الإرسال");
+    }
   };
 
-  const handleFiles = (files: FileList | null) => {
+  const handleFiles = async (files: FileList | null) => {
     if (!files) return;
-    Array.from(files).slice(0, 4).forEach((f) => {
-      if (f.size > 3 * 1024 * 1024) { alert(`${f.name} أكبر من 3MB`); return; }
-      const reader = new FileReader();
-      reader.onload = () => {
-        setAttachments((a) => [...a, { id: crypto.randomUUID(), name: f.name, type: f.type, dataUrl: reader.result as string }]);
-      };
-      reader.readAsDataURL(f);
-    });
+    const arr = Array.from(files).slice(0, 4);
+    for (const f of arr) {
+      if (f.size > 5 * 1024 * 1024) { toast.error(`${f.name} أكبر من 5MB`); continue; }
+      setUploadingCount((n) => n + 1);
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) throw new Error("لازم تسجل دخول");
+        const ext = (f.name.split(".").pop() || "bin").toLowerCase();
+        const path = `${user.id}/msg/${crypto.randomUUID()}.${ext}`;
+        const { error } = await supabase.storage.from("snowwolf-media").upload(path, f, { contentType: f.type });
+        if (error) throw error;
+        const { data } = supabase.storage.from("snowwolf-media").getPublicUrl(path);
+        setAttachments((a) => [...a, { id: crypto.randomUUID(), name: f.name, type: f.type, dataUrl: data.publicUrl }]);
+      } catch (err: any) {
+        toast.error(err.message || `فشل رفع ${f.name}`);
+      } finally {
+        setUploadingCount((n) => n - 1);
+      }
+    }
   };
 
   const onChange = (v: string) => {
@@ -77,7 +96,7 @@ export default function MessageInput({
         </div>
       )}
 
-      {attachments.length > 0 && (
+      {(attachments.length > 0 || uploadingCount > 0) && (
         <div className="flex gap-2 flex-wrap p-3 bg-card border border-border rounded-t-xl -mb-1">
           {attachments.map((a) => (
             <div key={a.id} className="relative group">
@@ -89,6 +108,11 @@ export default function MessageInput({
               <button onClick={() => setAttachments((arr) => arr.filter((x) => x.id !== a.id))} className="absolute -top-1 -left-1 w-5 h-5 rounded-full bg-destructive text-destructive-foreground text-xs flex items-center justify-center">×</button>
             </div>
           ))}
+          {uploadingCount > 0 && (
+            <div className="w-20 h-20 rounded-lg border border-border bg-secondary flex items-center justify-center">
+              <Loader2 className="w-6 h-6 text-primary animate-spin" />
+            </div>
+          )}
         </div>
       )}
 
