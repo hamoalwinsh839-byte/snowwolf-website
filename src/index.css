@@ -1,0 +1,128 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===========================================
+   SNOWWOLF CHAT - Custom Design System
+   هوية بصرية: أزرق جليدي + أبيض ثلجي + ليلي
+   =========================================== */
+
+@layer base {
+  :root {
+    --background: 222 35% 7%;
+    --foreground: 210 40% 96%;
+
+    --card: 222 30% 11%;
+    --card-foreground: 210 40% 96%;
+
+    --popover: 222 32% 9%;
+    --popover-foreground: 210 40% 96%;
+
+    --primary: 205 95% 58%;
+    --primary-foreground: 222 40% 8%;
+    --primary-glow: 200 100% 70%;
+
+    --secondary: 222 25% 14%;
+    --secondary-foreground: 210 40% 96%;
+
+    --muted: 222 22% 16%;
+    --muted-foreground: 215 20% 68%;
+
+    --accent: 195 100% 60%;
+    --accent-foreground: 222 40% 8%;
+
+    --destructive: 0 75% 58%;
+    --destructive-foreground: 210 40% 96%;
+
+    --success: 142 70% 48%;
+    --success-foreground: 222 40% 8%;
+
+    --border: 222 22% 18%;
+    --input: 222 22% 16%;
+    --ring: 205 95% 58%;
+
+    --radius: 0.875rem;
+
+    --rail: 222 38% 5%;
+    --rail-foreground: 210 40% 96%;
+
+    --sidebar-background: 222 32% 9%;
+    --sidebar-foreground: 210 25% 88%;
+    --sidebar-primary: 205 95% 58%;
+    --sidebar-primary-foreground: 222 40% 8%;
+    --sidebar-accent: 222 25% 14%;
+    --sidebar-accent-foreground: 205 95% 65%;
+    --sidebar-border: 222 22% 14%;
+    --sidebar-ring: 205 95% 58%;
+
+    --gradient-ice: linear-gradient(135deg, hsl(205 95% 58%), hsl(195 100% 50%));
+    --gradient-frost: linear-gradient(135deg, hsl(210 40% 96%) 0%, hsl(205 95% 70%) 100%);
+    --gradient-night: linear-gradient(180deg, hsl(222 38% 9%), hsl(222 35% 5%));
+    --gradient-glow: radial-gradient(ellipse at top, hsl(205 95% 58% / 0.18), transparent 60%);
+
+    --shadow-ice: 0 10px 40px -10px hsl(205 95% 58% / 0.5);
+    --shadow-deep: 0 20px 50px -20px hsl(222 60% 2% / 0.7);
+    --shadow-soft: 0 4px 20px -4px hsl(222 50% 2% / 0.4);
+
+    --ease-smooth: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Cairo', 'Inter', system-ui, sans-serif;
+    background-image: var(--gradient-glow);
+    background-attachment: fixed;
+  }
+  .font-display {
+    font-family: 'Tajawal', 'Cairo', sans-serif;
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer utilities {
+  .bg-rail { background-color: hsl(var(--rail)); }
+  .bg-gradient-ice { background-image: var(--gradient-ice); }
+  .bg-gradient-frost { background-image: var(--gradient-frost); }
+  .bg-gradient-night { background-image: var(--gradient-night); }
+  .shadow-ice { box-shadow: var(--shadow-ice); }
+  .shadow-deep { box-shadow: var(--shadow-deep); }
+  .shadow-soft { box-shadow: var(--shadow-soft); }
+  .text-ice { color: hsl(var(--primary)); }
+
+  .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted));
+    border-radius: 3px;
+  }
+
+  @keyframes pulse-ring {
+    0% { box-shadow: 0 0 0 0 hsl(var(--success) / 0.6); }
+    70% { box-shadow: 0 0 0 10px hsl(var(--success) / 0); }
+    100% { box-shadow: 0 0 0 0 hsl(var(--success) / 0); }
+  }
+  .animate-pulse-ring { animation: pulse-ring 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+  @keyframes float-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .animate-float-in { animation: float-in 0.4s var(--ease-smooth) both; }
+
+  @keyframes voice-bar {
+    0%, 100% { transform: scaleY(0.3); }
+    50% { transform: scaleY(1); }
+  }
+  .animate-voice-bar { animation: voice-bar 0.8s ease-in-out infinite; }
+
+  @keyframes snowfall {
+    0% { transform: translateY(-10vh) translateX(0); opacity: 0; }
+    10% { opacity: 0.6; }
+    90% { opacity: 0.6; }
+    100% { transform: translateY(110vh) translateX(20px); opacity: 0; }
+  }
+}
